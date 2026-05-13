@@ -15,6 +15,22 @@ provider_api: deepseek-function-calling
 provider_model_default: deepseek-chat
 function_schema_format: json-function-declarations
 
+# === Default-Action (per ausreden-schutz.md Schicht 2, Welle-47 Migration Batch-2) ===
+default_action:
+  description: "HeyLou-Sub-Function-Calling-Bridge zu DeepSeek: register_heylou_capabilities (search_hotels, get_rates, compare_otas, book_direct, optimize_revenue) + Function-Schema-Translation"
+  rho_per_run_eur: 80
+  rho_validation_source: unvalidated
+  block_gates:
+    - gate_id: K13_PAV
+      block_reason: "Pre-Action-Verification: book_direct ist K_0-relevant (Real-Booking-Charge), Phronesis-Required vor Real-Mode"
+      false_block_cost_eur: 60
+      legitimate_block_condition: "book_direct-Function ohne sandbox_default=true ODER ohne PHRONESIS_TICKET"
+    - gate_id: K12
+      block_reason: "Distillation-Resistenz: DeepSeek-Output darf nicht in HeyLou-Training feedback"
+      false_block_cost_eur: 40
+      legitimate_block_condition: "Provenance fehlt im Function-Response ODER non_llm_validation_layer disabled"
+  graceful_degradation_path: "Function-Calls auf Mock-Endpoints (Stub-Booking, Mock-Rates), kein Real-DeepSeek-API ohne Auth-Validation"
+
 # === LLM Providers ===
 llm_providers:
   - deepseek-chat
