@@ -1,0 +1,8 @@
+{
+  "df": "df-heylou-deepseek-extension",
+  "ts": "2026-06-05T09:50:06.627674+00:00",
+  "ok": true,
+  "bytes": 3785,
+  "model": "qwen2.5:14b-instruct",
+  "duration_s": 73.7
+}
