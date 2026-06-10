@@ -1,173 +1,128 @@
 # df-heylou-deepseek-extension — PRODUKTION [CRUX-MK]
-*2026-06-09T00:25:38.486564+00:00 | ollama-local/kemmer-14b-ctx8k*
+*2026-06-09T17:04:39.755026+00:00 | ollama-local/kemmer-14b-ctx8k*
 
 # df-heylou-deepseek-extension [CRUX-MK]
 
-## Einführung
+## Einleitung
 
-Die Integration von HeyLou als Sub-Funktion in DeepSeek erweitert die Fähigkeiten des DeepSeek-Systems durch den Zugriff auf das umfangreiche Wissen und die Funktionalitäten, die HeyLou bereitstellt. Diese Dokumentation beschreibt die Architektur, die Funktionen, die Integration und die Ausführungsschritte der Extension.
+Die Dark-Factory `df-heylou-deepseek-extension` integriert HeyLou als Sub-Funktion in DeepSeek's Function-Calling-API, um das Portfolio an Dienstleistungen für Hotellerie und Business Travel zu erweitern. Diese Integration ermöglicht es dem LLM (Large Language Model), direkt auf Daten im HeyLou Travel-Knowledge Graph zuzugreifen, um präzisere Antworten zur Verfügung zu stellen.
+
+## Welle-39 LLM Sub-Funktion Extension
+
+### Überblick
+Die Welle-39 der DeepSeek-Funktionalität bringt eine neue Dimension für die Integration von externen Systemen wie HeyLou. Die Erweiterung ermöglicht es dem Modell, Funktionen aufzurufen, die speziell für den Travel-Bereich entwickelt wurden und direkt in das System integriert sind.
+
+### Stack
+- **DeepSeek API-Plugin:** Die Grundlage, um externe Funktionen aufrufen zu können.
+- **Function-Calling:** Mechanismus zur Durchführung von Funktionsaufrufen innerhalb des LLMs.
+
+## HeyLou Capability Set
+
+HeyLou bietet fünf verschiedene Funktionen, die durch das DeepSeek LLM aufgerufen werden können:
+
+| Function | Beschreibung | Backend |
+|---|---|---|
+| `search_hotels(location, dates, preferences)` | Sucht Hotels im Bereich des Travel-Knowledge Graphs. | df-heylou-travel-domain |
+| `get_rates(hotel_id, date_range)` | Ruft die Preise für ein Hotel ab, basierend auf der angegebenen Zeitraum. | df-pms-mews-adapter (Welle 36) |
+| `compare_otas(hotel_id, dates)` | Vergleicht die Bookings durch verschiedene OTAs (Online Travel Agents). | df-ota-* (Welle 37) |
+| `book_direct(hotel_id, room_type, guest, dates)` | Führt eine Buchung direkt über HeyLou ohne Kommissionierung aus. | df-heylou-travel-domain |
+| `optimize_revenue(hotel_id)` | Berechnet ein Revenue-Optimierungsmodell für ein Hotel (vorläufig). | Welle 40 (vorläufig) |
+
+### Beispiele für Funktionsaufrufe
+1. **Hotel-Suche:**
+   ```python
+   tools = [{"function_declarations": HEYLOU_FUNCTION_DEFINITIONS}]
+   response = deepseek_client.generate_content(prompt="Find hotels in Berlin for July 2026 with a preference for budget hotels.", tools=tools)
+   ```
+   
+2. **Rate-Ermittlung:**
+   ```python
+   result = extension.handle_function_call({"function": "get_rates", "hotel_id": "H12345", "date_range": ["2026-07-01", "2026-07-15"]})
+   ```
+   
+3. **OTA-Spreading:**
+   ```python
+   response = deepseek_client.generate_content(prompt="Compare OTA bookings for Hotel H12345 in June 2026.", tools=tools)
+   ```
+
+## Provider-API-Pattern
+
+### JSON-Schema für Funktionenaufrufe
+Das DeepSeek-Modell verwendet ein JSON-Schema, um Tool-Deklarationen zu definieren. Dieses Schema wird dann von der Extension genutzt, um Funktionsanrufe an das entsprechende Backend weiterzuleiten.
+
+```python
+tools = [{"function_declarations": HEYLOU_FUNCTION_DEFINITIONS}]
+response = deepseek_client.generate_content(prompt=prompt_text, tools=tools)
+```
+
+### Beispiel für den JSON-Schema-Content
+Hier ist ein Beispiel für die Deklaration der `search_hotels` Funktion:
+```json
+{
+  "name": "search_hotels",
+  "description": "Sucht Hotels im Bereich des Travel-Knowledge Graphs.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "location": { "type": "string" },
+      "dates": { "type": "array", "items": { "type": "string", "format": "date" } },
+      "preferences": { "type": "object", "description": "Zusätzliche Präferenzen wie Preisbereich, Sternezahl usw." }
+    }
+  }
+}
+```
+
+## Sandbox-Default
+Um Entwicklung und Testzwecke zu unterstützen, gibt es zwei Betriebsmodi:
+- **Mock-Modus:** Wenn `DF_HEYLOU_DEEPSEEK_EXT_ENABLED=false`, werden synthetische Antworten basierend auf einem mockten Travel-Knowledge Graph bereitgestellt.
+- **Real-Modus:** Mit aktivierten Umgebungsvariablen (`DF_HEYLOU_DEEPSEEK_EXT_ENABLED=true`), `PHRONESIS_TICKET` und `DEEPSEEK_API_KEY`, werden echte Anfragen an das HeyLou System gesendet.
 
 ## Architektur
 
-Die Architektur der `df-heylou-deepseek-extension` umfasst eine Kette von Komponenten, die miteinander interagieren, um Anfragen des DeepSeek-Systems zu verarbeiten und zu beantworten. Die Schritte sind wie folgt:
+Die Architektur ist modelliert, um eine robuste Kommunikation zwischen dem LLM und den externen Backend-Systemen sicherzustellen:
 
 ```
 DeepSeek-LLM → functionCall → DeepSeekExtension.handle_function_call()
                               ├── search_hotels    → df-heylou-travel-domain
-                              ├── get_rates        → df-pms-mews-adapter (Welle 36)
+                              ├── get_rates        → df-pms-mews-adapter
                               ├── compare_otas     → df-ota-* (Welle 37)
                               ├── book_direct      → df-heylou-travel-domain
-                              └── optimize_revenue → Welle 40 Stub
+                              └── optimize_revenue → Welle 40 (vorläufig)
                               ↓
                           AuditLogger (HMAC-SHA256 JSONL)
 ```
 
-### Funktionsbeschreibungen
+## Security und Compliance
 
-Die `df-heylou-deepseek-extension` bietet eine Reihe von Funktionen, die direkt im DeepSeek-System aufgerufen werden können:
+- **Pre-Action Verification:** Der `auth_handler.verify_phronesis_ticket()` Mechanismus wird verwendet, um sicherzustellen, dass jeder Funktionsaufruf autorisiert ist.
+- **Audit Logging:** Alle Anrufe werden in einem audit-log überwacht, der HMAC-SHA256 verwendet, um die Integrität zu sichern.
 
-| Function | Beschreibung | Backend |
-|---|---|---|
-| `search_hotels(location, dates, preferences)` | Durchsucht den Travel-Knowledge Graph für Hotels, basierend auf der angegebenen Location und Datumsbereich. | df-heylou-travel-domain |
-| `get_rates(hotel_id, date_range)` | Holt die PMS/RMS-Rates für ein spezifisches Hotel über einen bestimmten Zeitraum. | df-pms-mews-adapter (Welle 36) |
-| `compare_otas(hotel_id, dates)` | Vergleicht die OTA-Spreizung für ein Hotel in den angegebenen Daten. | df-ota-* (Welle 37) |
-| `book_direct(hotel_id, room_type, guest, dates)` | Führt eine direkte Buchung durch das HeyLou System ohne Kommission durch. | df-heylou-travel-domain |
-| `optimize_revenue(hotel_id)` | Stellt ein Revenue-Optimizer Stub zur Verfügung, der in Welle 40 vollständig implementiert sein wird. | Welle 40 (vorläufig) |
+## Deployment und Verwaltung
 
-### Sandbox-Default
-
-Die Sandbox-Optionen ermöglichen es, zwischen einem simulierten und echten Modus zu wechseln:
-
-- `DF_HEYLOU_DEEPSEEK_EXT_ENABLED=false`: Diese Option führt zu Mock-Antworten, die auf einer synthetischen Travel-Knowledge Graph basieren.
-- `DF_HEYLOU_DEEPSEEK_EXT_ENABLED=true`, `PHRONESIS_TICKET` und `DEEPSEEK_API_KEY`: In diesem Modus wird das System im echten Modus ausgeführt.
-
-## Sandbox-Integration
-
-Um die Sandbox zu aktivieren, muss eine Umgebungsvariable gesetzt werden:
-
+### Sandbox-Mitglieder
+Für den Betrieb im Sandbox-Modus wird ein Plist-Datei bereitgestellt:
 ```bash
-export DF_HEYLOU_DEEPSEEK_EXT_ENABLED=true
+scripts/com.kemmer.df-heylou-deepseek-extension.plist
 ```
+Die Startinterval ist auf 7200 Sekunden (2 Stunden) eingestellt, um Ressourcen zu sparen.
 
-Neben dieser Variablen müssen auch der `PHRONESIS_TICKET` und der `DEEPSEEK_API_KEY` bereitgestellt sein. Diese Schlüssel gewährleisten die Authentifizierung und Autorisierung des Systems, um sicherzustellen, dass alle Anfragen legal und sicher sind.
-
-## Integration mit DeepSeek Function-Calling
-
-### JSON-Schema Definition
-
-Um die Funktionalität von HeyLou in DeepSeek zu integrieren, muss ein JSON-Schema definiert werden. Dieses Schema enthält eine Liste der verfügbaren Funktionen, einschließlich ihrer Parameter und Rückgabetypen.
-
-```json
-{
-  "functions": [
-    {
-      "name": "search_hotels",
-      "description": "Sucht Hotels im Travel-Knowledge Graph.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "location": { "type": "string" },
-          "dates": { "type": "array", "items": { "type": "string" } },
-          "preferences": { "type": "object" }
-        },
-        "required": ["location", "dates"]
-      }
-    },
-    {
-      "name": "get_rates",
-      "description": "Holt die PMS/RMS-Rates für ein spezifisches Hotel.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "hotel_id": { "type": "string" },
-          "date_range": { "type": "array", "items": { "type": "string" } }
-        },
-        "required": ["hotel_id", "date_range"]
-      }
-    },
-    {
-      "name": "compare_otas",
-      "description": "Vergleicht die OTA-Spreizung für ein Hotel.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "hotel_id": { "type": "string" },
-          "dates": { "type": "array", "items": { "type": "string" } }
-        },
-        "required": ["hotel_id", "dates"]
-      }
-    },
-    {
-      "name": "book_direct",
-      "description": "Führt eine direkte Buchung durch das HeyLou System.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "hotel_id": { "type": "string" },
-          "room_type": { "type": "string" },
-          "guest": { "type": "object" },
-          "dates": { "type": "array", "items": { "type": "string" } }
-        },
-        "required": ["hotel_id", "room_type", "guest", "dates"]
-      }
-    },
-    {
-      "name": "optimize_revenue",
-      "description": "Stellt einen Revenue-Optimizer Stub zur Verfügung.",
-      "parameters": {}
-    }
-  ]
-}
-```
-
-### Aufruf von Funktionen
-
-Um eine Funktion aufzurufen, wird das JSON-Schema mit den notwendigen Parametern verwendet und der DeepSeek Client wird aufgerufen:
-
-```python
-tools = [{"function_declarations": HEYLOU_FUNCTION_DEFINITIONS}]
-response = deepseek_client.generate_content(prompt, tools=tools)
-for part in response.candidates[0].content.parts:
-    if part.function_call:
-        result = extension.handle_function_call(part.function_call)
-```
-
-## Sandbox-Tests
-
-Um die Integration zu testen, können Tests verwendet werden:
-
+### Tests
+Um die Funktionalität und Stabilität der Erweiterung sicherzustellen, sind automatisierte Tests integriert:
 ```bash
 pytest tests/ -v
 ```
 
-Diese Tests bestätigen, dass alle Funktionen korrekt implementiert und ausgeführt werden.
+## Cross-DF-Coupling (Welle 36/Welle 37 Backends)
 
-## K11-K16 + LC1-LC5
+Die Extension arbeitet eng mit anderen Dark-Factories zusammen, um ein komplexes System von Dienstleistungen und Datenquellen zu erstellen. Insbesondere:
 
-Die Sicherheitsrichtlinien (K11-K16) und die Lifecycle-Checks (LC1-LC5) sind in der Datei `config.yaml` definiert. Die Pre-Action-Verification erfolgt über eine Authentifizierung mit dem Phronesis-Ticket:
+- **df-pms-mews-adapter** für die Kommunikation mit den Property Management Systems.
+- **df-ota-* (Welle 37)** für das Analysieren der OTA Buchungsdaten.
 
-```python
-auth_handler.verify_phronesis_ticket()
-```
+## Zusammenfassung
 
-Zusätzlich wird ein Mutex für das Skript verwendet, um sicherzustellen, dass keine parallelen Vorgänge auftreten:
+Die Integration von HeyLou in DeepSeek erweitert die Funktionalitäten des LLMs und bietet Anwendern präzisere, personalisierte Dienstleistungen im Bereich des Business Travels. Durch eine klare Architektur und Sicherheitsmaßnahmen wird sichergestellt, dass diese Integration robust und sicher ist.
 
-```bash
-mkdir -p /tmp/df-heylou-deepseek-extension
-```
+---
 
-## LaunchAgent
-
-Für die kontinuierliche Ausführung der Extension ist ein LaunchAgent definiert. Dieses Skript startet die Extension regelmäßig und stellt sicher, dass sie stets im Hintergrund läuft:
-
-```bash
-Plist: scripts/com.kemmer.df-heylou-deepseek-extension.plist
-StartInterval: 7200s (2h), RunAtLoad: true
-WorkingDir: /Users/make/Projects/dark-factories/df-heylou-deepseek-extension
-```
-
-## Cross-DF-Coupling
-
-Die `df-heylou-deepseek-extension` nutzt Backend-Systeme aus anderen DF, wie z.B. `df-pms-mews-adapter` (Welle 36) und `df-ota-*` (Welle 37), um ihre Funktionalität zu erweitern.
-
-Diese Integrationen sind entscheidend für die Leistung der Extension und ermöglichen es ihr, den kompletten Wert des HeyLou Systems im DeepSeek Kontext zu nutzen.
+Diese Dokumentation deckt die wesentlichen Aspekte der Dark-Factory `df-heylou-deepseek-extension` ab und bereitet den Weg für die effektive Nutzung dieser Technologie in produktiven Projekten.
