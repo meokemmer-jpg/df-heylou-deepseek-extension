@@ -1,0 +1,44 @@
+[
+  {
+    "base_rate_eur": 91.0,
+    "city": "Hildesheim",
+    "country": "DE",
+    "direct_discount_pct": 7.0,
+    "hotel_id": "hildesheim-city",
+    "inventory": {
+      "standard": 9,
+      "suite": 2,
+      "superior": 5
+    },
+    "name": "HeyLou Hildesheim City",
+    "quality_score": 8.4
+  },
+  {
+    "base_rate_eur": 124.0,
+    "city": "Munich",
+    "country": "DE",
+    "direct_discount_pct": 5.0,
+    "hotel_id": "munich-east",
+    "inventory": {
+      "standard": 7,
+      "suite": 1,
+      "superior": 4
+    },
+    "name": "HeyLou Munich East",
+    "quality_score": 8.8
+  },
+  {
+    "base_rate_eur": 109.0,
+    "city": "Berlin",
+    "country": "DE",
+    "direct_discount_pct": 6.0,
+    "hotel_id": "berlin-mitte",
+    "inventory": {
+      "standard": 10,
+      "suite": 2,
+      "superior": 6
+    },
+    "name": "HeyLou Berlin Mitte",
+    "quality_score": 8.6
+  }
+]

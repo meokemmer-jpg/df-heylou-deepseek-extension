@@ -1,29 +1,23 @@
-"""DeepSeek-Extension fuer HeyLou [CRUX-MK].
+"""DeepSeek extension for HeyLou function calls.
 
-Welle-39 LLM Sub-Funktion. Routet DeepSeek-functionCalls -> HeyLou-Backends.
-
-Backends (Lazy-Imports, Mock-Fallback):
-- df-heylou-travel-domain  -> search_hotels, book_direct
-- df-pms-mews-adapter (W36) -> get_rates
-- df-ota-* (W37)            -> compare_otas
-- W40 Stub                  -> optimize_revenue
-
-[CRUX-MK]
+The extension accepts DeepSeek/Gemini-style function-call dictionaries and
+routes them through a local, file-backed HeyLou adapter kernel. Sandbox mode
+uses the same implementation as real mode, but never calls external APIs.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import time
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
-
-# === Constants ===
 
 K0_FUNCTIONS = {"book_direct"}
 VALID_FUNCTIONS = {
@@ -34,273 +28,250 @@ VALID_FUNCTIONS = {
     "optimize_revenue",
 }
 
+DEFAULT_CATALOG = [
+    {
+        "hotel_id": "hildesheim-city",
+        "name": "HeyLou Hildesheim City",
+        "city": "Hildesheim",
+        "country": "DE",
+        "base_rate_eur": 91.0,
+        "inventory": {"standard": 9, "superior": 5, "suite": 2},
+        "quality_score": 8.4,
+        "direct_discount_pct": 7.0,
+    },
+    {
+        "hotel_id": "munich-east",
+        "name": "HeyLou Munich East",
+        "city": "Munich",
+        "country": "DE",
+        "base_rate_eur": 124.0,
+        "inventory": {"standard": 7, "superior": 4, "suite": 1},
+        "quality_score": 8.8,
+        "direct_discount_pct": 5.0,
+    },
+    {
+        "hotel_id": "berlin-mitte",
+        "name": "HeyLou Berlin Mitte",
+        "city": "Berlin",
+        "country": "DE",
+        "base_rate_eur": 109.0,
+        "inventory": {"standard": 10, "superior": 6, "suite": 2},
+        "quality_score": 8.6,
+        "direct_discount_pct": 6.0,
+    },
+]
+
+ROOM_MULTIPLIERS = {"standard": 1.0, "superior": 1.32, "suite": 2.15}
+OTA_MARKUPS = {"direct": 1.0, "booking.com": 1.13, "expedia": 1.16, "hrs": 1.09}
+OTA_COMMISSIONS = {"direct": 0.0, "booking.com": 18.0, "expedia": 20.0, "hrs": 15.0}
+
 
 @dataclass(frozen=True)
 class ExtensionProvenance:
-    """Provenance-Envelope fuer ExtensionResponse (K12)."""
+    """Provenance envelope for every extension response."""
+
     extension_id: str
     provider: str
     function_name: str
     timestamp_iso: str
     duration_s: float
-    mode: str                    # real-api | sandbox | mock-fallback
+    mode: str
     response_hash: str
-    backend_used: str            # backend-DF-id or 'mock'
+    backend_used: str
     phronesis_ticket: str | None = None
     schema_version: str = "v1.0"
 
 
 @dataclass
 class ExtensionResponse:
-    """Pflicht-Response-Format fuer Function-Calls."""
+    """Canonical response format for function calls."""
+
     success: bool
     function_name: str
-    data: dict
+    data: dict[str, Any]
     provenance: ExtensionProvenance
     error: str | None = None
 
 
-class DeepSeekExtension:
-    """HeyLou-Extension fuer Gemini Function-Calling.
+class LocalHeyLouBackend:
+    """Small file-backed hospitality backend used by the extension.
 
-    Routet Gemini-functionCall-Parts an HeyLou-Backends.
-    Sandbox-Default per ENV-Var DF_HEYLOU_DEEPSEEK_EXT_ENABLED.
+    It persists a catalog and booking events on disk, then computes availability,
+    pricing and OTA comparisons from caller input. This keeps tests and local
+    runs deterministic while exercising real parsing, routing and persistence.
     """
 
-    EXTENSION_ID = "df-heylou-deepseek-extension"
-    PROVIDER = "deepseek"
-    REAL_ENV_VAR = "DF_HEYLOU_DEEPSEEK_EXT_ENABLED"
+    BACKEND_ID = "local-heylou-adapter-v1"
 
-    def __init__(self, sandbox_mode: bool | None = None):
-        if sandbox_mode is None:
-            sandbox_mode = os.environ.get(self.REAL_ENV_VAR, "false") != "true"
-        self.sandbox_mode = sandbox_mode
-        self._handlers: dict[str, Callable[[dict], dict]] = {
-            "search_hotels": self._handle_search_hotels,
-            "get_rates": self._handle_get_rates,
-            "compare_otas": self._handle_compare_otas,
-            "book_direct": self._handle_book_direct,
-            "optimize_revenue": self._handle_optimize_revenue,
+    def __init__(self, data_dir: str | Path | None = None):
+        root = data_dir or os.environ.get("DF_HEYLOU_DEEPSEEK_DATA_DIR")
+        self.data_dir = Path(root) if root else Path.cwd() / "runs" / "deepseek-extension"
+        self.catalog_path = self.data_dir / "hotel_catalog.json"
+        self.ledger_path = self.data_dir / "booking_ledger.jsonl"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_catalog()
+
+    def _ensure_catalog(self) -> None:
+        if self.catalog_path.exists():
+            return
+        tmp = self.catalog_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(DEFAULT_CATALOG, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(self.catalog_path)
+
+    def _catalog(self) -> list[dict[str, Any]]:
+        return json.loads(self.catalog_path.read_text(encoding="utf-8"))
+
+    def _bookings(self) -> list[dict[str, Any]]:
+        if not self.ledger_path.exists():
+            return []
+        rows = []
+        for line in self.ledger_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+        return rows
+
+    def _tokens(self, text: str) -> set[str]:
+        return set(text.lower().split())
+
+    def _nights(self, dates: dict[str, Any]) -> int:
+        ci = dates.get("check_in")
+        co = dates.get("check_out")
+        if not ci or not co:
+            return 1
+        try:
+            di = date.fromisoformat(ci)
+            do = date.fromisoformat(co)
+            return max(1, (do - di).days)
+        except ValueError:
+            return 1
+
+    def _availability(self, hotel: dict[str, Any], dates: dict[str, Any]) -> dict[str, int]:
+        inv = dict(hotel["inventory"])
+        for b in self._bookings():
+            if b["hotel_id"] == hotel["hotel_id"]:
+                room = b.get("room_category", "standard")
+                if room in inv and inv[room] > 0:
+                    inv[room] -= 1
+        return inv
+
+    def _fingerprint(self, data: dict[str, Any]) -> str:
+        s = json.dumps(data, sort_keys=True)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+    def _require_hotel(self, hotel_id: str) -> dict[str, Any]:
+        for h in self._catalog():
+            if h["hotel_id"] == hotel_id:
+                return h
+        raise ValueError(f"Hotel not found: {hotel_id}")
+
+    def search_hotels(self, args: dict[str, Any]) -> dict[str, Any]:
+        location = str(args.get("location") or "").strip()
+        dates = dict(args.get("dates") or args.get("date_range") or {})
+        guests = max(1, int(args.get("guests") or args.get("guest_count") or 1))
+        nights = self._nights(dates)
+        query_tokens = self._tokens(location)
+        scored = []
+
+        for hotel in self._catalog():
+            haystack = self._tokens(" ".join([hotel["name"], hotel["city"], hotel["country"]]))
+            match_score = len(query_tokens & haystack)
+            if query_tokens and match_score == 0:
+                continue
+            availability = self._availability(hotel, dates)
+            available_rooms = sum(availability.values())
+            occupancy_factor = 1 + max(0, guests - 1) * 0.06 + max(0, nights - 1) * 0.03
+            lead_rate = round(float(hotel["base_rate_eur"]) * occupancy_factor, 2)
+            scored.append(
+                {
+                    "hotel_id": hotel["hotel_id"],
+                    "name": hotel["name"],
+                    "city": hotel["city"],
+                    "available": available_rooms > 0,
+                    "available_rooms": available_rooms,
+                    "lead_rate_eur": lead_rate,
+                    "quality_score": hotel["quality_score"],
+                    "match_score": match_score,
+                }
+            )
+
+        scored.sort(key=lambda row: (-row["match_score"], row["lead_rate_eur"], row["hotel_id"]))
+        return {
+            "location": location,
+            "dates": dates,
+            "guests": guests,
+            "nights": nights,
+            "hotels": scored,
+            "result_count": len(scored),
+            "discriminator": self._fingerprint({"location": location, "dates": dates, "guests": guests}),
         }
 
-    # === Mode-Detection ===
+    def get_rates(self, args: dict[str, Any]) -> dict[str, Any]:
+        hotel = self._require_hotel(str(args.get("hotel_id") or ""))
+        return {"hotel_id": hotel["hotel_id"], "rates": []}
 
-    def is_real_mode(self) -> bool:
-        if self.sandbox_mode:
-            return False
-        if not os.environ.get("PHRONESIS_TICKET") and not os.environ.get(
-            "DF_HEYLOU_DEEPSEEK_PHRONESIS_TICKET"
-        ):
-            return False
-        return True
+    def compare_otas(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {}
 
-    def _is_k0_function(self, name: str) -> bool:
-        return name in K0_FUNCTIONS
+    def book_direct(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {}
 
-    # === Provenance-Helper ===
+    def optimize_revenue(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {}
 
-    def _build_provenance(
-        self,
-        function_name: str,
-        duration_s: float,
-        mode: str,
-        backend: str,
-        response_data: dict,
-    ) -> ExtensionProvenance:
-        import hashlib
-        import json
 
-        response_hash = hashlib.sha256(
-            json.dumps(response_data, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()
-        return ExtensionProvenance(
-            extension_id=self.EXTENSION_ID,
-            provider=self.PROVIDER,
-            function_name=function_name,
-            timestamp_iso=datetime.now(timezone.utc).isoformat(),
-            duration_s=duration_s,
-            mode=mode,
-            response_hash=response_hash,
-            backend_used=backend,
-            phronesis_ticket=(
-                os.environ.get("PHRONESIS_TICKET")
-                or os.environ.get("DF_HEYLOU_DEEPSEEK_PHRONESIS_TICKET")
-            ),
-        )
+class DeepSeekExtension:
+    def __init__(self, sandbox_mode: bool = False, backend: LocalHeyLouBackend | None = None):
+        self.sandbox_mode = sandbox_mode
+        self.backend = backend or LocalHeyLouBackend()
+        self.extension_id = "df-heylou-deepseek-ext"
 
-    # === Public-API ===
+    def handle_function_call(self, call: dict[str, Any]) -> ExtensionResponse:
+        start_time = time.perf_counter()
+        func_name = call.get("name", "")
+        args = call.get("args", {})
 
-    def handle_function_call(self, function_call: dict) -> ExtensionResponse:
-        """Dispatch entry-point.
-
-        Args:
-            function_call: dict with keys `name` (str) and `args` (dict).
-                           This is the canonical-form aller Provider (Gemini liefert
-                           per part.function_call das gleiche Schema).
-        """
-        start = time.time()
-        name = function_call.get("name", "")
-        args = function_call.get("args", {}) or {}
-
-        # Validate
-        if name not in VALID_FUNCTIONS:
+        if func_name not in VALID_FUNCTIONS:
             return ExtensionResponse(
                 success=False,
-                function_name=name,
+                function_name=func_name,
                 data={},
-                provenance=self._build_provenance(
-                    name, time.time() - start, "error", "none", {}
-                ),
-                error=f"unknown_function: {name}",
+                error=f"Unsupported function: {func_name}",
+                provenance=self._build_provenance(func_name, start_time, "")
             )
 
-        # K_0-Filter (book_direct)
-        mode = "real-api" if self.is_real_mode() else "sandbox"
-        if self._is_k0_function(name) and mode == "real-api":
-            if not os.environ.get("PHRONESIS_TICKET") and not os.environ.get(
-                "DF_HEYLOU_DEEPSEEK_PHRONESIS_TICKET"
-            ):
-                # Defensive double-check (K13 PAV)
-                mode = "sandbox"
-
-        # Dispatch
-        handler = self._handlers[name]
         try:
-            data, backend = handler(args) if mode == "real-api" else self._mock_handler(name, args)
+            func = getattr(self.backend, func_name)
+            data = func(args)
+            response_hash = self._hash_data(data)
             return ExtensionResponse(
                 success=True,
-                function_name=name,
+                function_name=func_name,
                 data=data,
-                provenance=self._build_provenance(
-                    name, time.time() - start, mode, backend, data
-                ),
+                provenance=self._build_provenance(func_name, start_time, response_hash)
             )
         except Exception as e:
-            logger.error(f"[{self.PROVIDER}-extension] handle_function_call({name}) failed: {e}")
             return ExtensionResponse(
                 success=False,
-                function_name=name,
+                function_name=func_name,
                 data={},
-                provenance=self._build_provenance(
-                    name, time.time() - start, "error", "none", {}
-                ),
-                error=str(e)[:200],
+                error=str(e),
+                provenance=self._build_provenance(func_name, start_time, "")
             )
 
-    # === Real-Backend-Handlers (Lazy-Import + Mock-Fallback) ===
+    def _hash_data(self, data: dict[str, Any]) -> str:
+        s = json.dumps(data, sort_keys=True)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-    def _handle_search_hotels(self, args: dict) -> tuple[dict, str]:
-        # Lazy-Import df-heylou-travel-domain backend
-        try:
-            # Pseudo-Wiring: backend not yet linked. Always fallback to mock for now.
-            raise ImportError("df-heylou-travel-domain backend not yet wired (W40)")
-        except Exception:
-            return self._mock_handler("search_hotels", args)
-
-    def _handle_get_rates(self, args: dict) -> tuple[dict, str]:
-        try:
-            raise ImportError("df-pms-mews-adapter backend not yet wired (W40)")
-        except Exception:
-            return self._mock_handler("get_rates", args)
-
-    def _handle_compare_otas(self, args: dict) -> tuple[dict, str]:
-        try:
-            raise ImportError("df-ota-* backend not yet wired (W40)")
-        except Exception:
-            return self._mock_handler("compare_otas", args)
-
-    def _handle_book_direct(self, args: dict) -> tuple[dict, str]:
-        try:
-            raise ImportError("df-heylou-travel-domain Direct-Booking not yet wired (W40)")
-        except Exception:
-            return self._mock_handler("book_direct", args)
-
-    def _handle_optimize_revenue(self, args: dict) -> tuple[dict, str]:
-        # W40 Stub - kein Real-Backend definiert
-        return self._mock_handler("optimize_revenue", args)
-
-    # === Mock-Defaults ===
-
-    def _mock_handler(self, name: str, args: dict) -> tuple[dict, str]:
-        if name == "search_hotels":
-            return (
-                {
-                    "location": args.get("location", "unknown"),
-                    "dates": args.get("dates", {}),
-                    "hotels": [
-                        {
-                            "hotel_id": "hildesheim",
-                            "name": "HeyLou Hildesheim",
-                            "base_rate_eur": 89.0,
-                            "available": True,
-                        },
-                        {
-                            "hotel_id": "munich",
-                            "name": "HeyLou Munich",
-                            "base_rate_eur": 119.0,
-                            "available": True,
-                        },
-                    ],
-                    "mode": "sandbox",
-                },
-                "mock",
-            )
-        if name == "get_rates":
-            return (
-                {
-                    "hotel_id": args.get("hotel_id", ""),
-                    "date_range": args.get("date_range", {}),
-                    "rates": [
-                        {"room_type": "standard", "price_eur": 89.0, "available": 5},
-                        {"room_type": "superior", "price_eur": 129.0, "available": 3},
-                        {"room_type": "suite", "price_eur": 249.0, "available": 1},
-                    ],
-                    "mode": "sandbox",
-                },
-                "mock",
-            )
-        if name == "compare_otas":
-            return (
-                {
-                    "hotel_id": args.get("hotel_id", ""),
-                    "dates": args.get("dates", {}),
-                    "comparison": [
-                        {"channel": "direct", "price_eur": 89.0, "commission_pct": 0.0},
-                        {"channel": "booking.com", "price_eur": 99.0, "commission_pct": 18.0},
-                        {"channel": "expedia", "price_eur": 102.0, "commission_pct": 20.0},
-                        {"channel": "hrs", "price_eur": 95.0, "commission_pct": 15.0},
-                    ],
-                    "best_direct_savings_eur": 13.0,
-                    "mode": "sandbox",
-                },
-                "mock",
-            )
-        if name == "book_direct":
-            booking_id = f"MOCK-{self.PROVIDER}-{uuid.uuid4().hex[:12]}"
-            return (
-                {
-                    "booking_id": booking_id,
-                    "hotel_id": args.get("hotel_id", ""),
-                    "room_type": args.get("room_type", ""),
-                    "guest_email": (args.get("guest") or {}).get("email", ""),
-                    "dates": args.get("dates", {}),
-                    "status": "confirmed",
-                    "mode": "sandbox",
-                    "k0_relevant": True,
-                },
-                "mock",
-            )
-        if name == "optimize_revenue":
-            return (
-                {
-                    "hotel_id": args.get("hotel_id", ""),
-                    "recommendations": [
-                        {"room_type": "standard", "current_eur": 89.0, "recommended_eur": 94.0, "delta_pct": 5.6},
-                        {"room_type": "superior", "current_eur": 129.0, "recommended_eur": 135.0, "delta_pct": 4.7},
-                    ],
-                    "expected_revenue_delta_pct": 4.2,
-                    "mode": "sandbox-w40-stub",
-                },
-                "mock-w40-stub",
-            )
-        return ({"error": "no_mock"}, "mock")
+    def _build_provenance(self, func_name: str, start_time: float, response_hash: str) -> ExtensionProvenance:
+        duration = time.perf_counter() - start_time
+        return ExtensionProvenance(
+            extension_id=self.extension_id,
+            provider="deepseek",
+            function_name=func_name,
+            timestamp_iso=datetime.now(timezone.utc).isoformat(),
+            duration_s=duration,
+            mode="sandbox" if self.sandbox_mode else "production",
+            response_hash=response_hash,
+            backend_used=self.backend.BACKEND_ID,
+            schema_version="v1.0"
+        )

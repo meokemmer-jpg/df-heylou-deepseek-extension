@@ -1,0 +1,6 @@
+{
+  "verdict": "HOLDS",
+  "reason": "Der Test ruft die echte Extension mit echtem file-backed Backend im Sandbox-Modus auf und zeigt, dass ein gueltiger Suchort andere Resultate, Hashes und Diskriminatoren erzeugt als ein adversarialer unmoeglicher Ort.",
+  "ts": "2026-07-28T18:59:56.268953+00:00",
+  "attempts": 1
+}
